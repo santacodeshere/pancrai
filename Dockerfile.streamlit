@@ -1,0 +1,60 @@
+# PancrAI — Streamlit Frontend Dockerfile
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+    libglu1-mesa libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
+
+# Only the dependencies Streamlit needs
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir \
+    streamlit==1.35.0 \
+    plotly==5.22.0 \
+    Pillow==10.3.0 \
+    requests==2.32.2 \
+    numpy==1.26.4 \
+    python-dotenv==1.0.1 \
+    pandas==2.2.2 \
+    torch==2.3.0 \
+    torchvision==0.18.0 \
+    timm==0.9.16 \
+    einops==0.7.0 \
+    opencv-python-headless==4.9.0.80 \
+    google-generativeai==0.5.4 \
+    groq==0.8.0
+
+# Copy source
+COPY frontend/ ./frontend/
+COPY app/ ./app/
+COPY utils/ ./utils/
+
+# Streamlit config
+RUN mkdir -p ~/.streamlit && printf '\
+[server]\n\
+headless = true\n\
+enableCORS = false\n\
+enableXsrfProtection = false\n\
+port = 8501\n\
+\n\
+[theme]\n\
+base = "dark"\n\
+primaryColor = "#58A6FF"\n\
+backgroundColor = "#0D1117"\n\
+secondaryBackgroundColor = "#161B22"\n\
+textColor = "#E6EDF3"\n' > ~/.streamlit/config.toml
+
+EXPOSE 8501
+
+ENV API_BASE_URL=http://api:8000/api/v1
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
+
+CMD ["streamlit", "run", "frontend/streamlit_app.py", \
+     "--server.port=8501", "--server.address=0.0.0.0"]

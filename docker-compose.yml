@@ -1,0 +1,91 @@
+# PancrAI — Docker Compose
+# Runs FastAPI backend + Streamlit frontend + optional Nginx reverse proxy
+#
+# Usage:
+#   docker compose up                  # start all services
+#   docker compose up api              # start only the API
+#   docker compose up --build          # rebuild images
+#   docker compose down                # stop everything
+#   docker compose logs -f api         # stream API logs
+
+version: "3.9"
+
+services:
+
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pancrai_api
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=sqlite:////app/data/pancrai.db
+      - MODEL_WEIGHTS_PATH=/app/weights/transunet_best.pth
+      - CLASSIFIER_WEIGHTS_PATH=/app/weights/efficientnet_best.pth
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    volumes:
+      - pancrai_uploads:/app/uploads
+      - pancrai_weights:/app/weights
+      - pancrai_db:/app/data
+    ports:
+      - "8000:8000"
+    networks:
+      - pancrai_net
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Streamlit Frontend ────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: pancrai_ui
+    restart: unless-stopped
+    environment:
+      - API_BASE_URL=http://api:8000/api/v1
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - pancrai_net
+
+  # ── Nginx Reverse Proxy (optional) ────────────────────────────────────────
+  # Uncomment this section to serve both services on port 80
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: pancrai_nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+  #   depends_on:
+  #     - api
+  #     - ui
+  #   networks:
+  #     - pancrai_net
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  pancrai_uploads:
+    driver: local
+  pancrai_weights:
+    driver: local
+  pancrai_db:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  pancrai_net:
+    driver: bridge

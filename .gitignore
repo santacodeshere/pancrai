@@ -1,0 +1,70 @@
+# PancrAI .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Environment / secrets
+.env
+!.env.example
+
+# Data — do NOT commit real patient data
+data/
+uploads/
+*.dcm
+*.nii
+*.nii.gz
+
+# Model weights — large files
+weights/*.pth
+weights/*.pt
+weights/*.ckpt
+!weights/.gitkeep
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and outputs
+*.log
+logs/
+runs/
+output/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Pytest
+.coverage
+htmlcov/
