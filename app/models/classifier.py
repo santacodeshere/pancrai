@@ -156,10 +156,11 @@ def classify_from_mask(mask: np.ndarray) -> dict:
 
     # Malignant: irregular borders, large, or elongated
     is_malignant = (
-        solidity < 0.72
-        or area_pct > 15.0
-        or aspect > 2.4
-        or (solidity < 0.80 and area_pct > 8.0)
+        solidity < 0.78
+        or area_pct > 10.0
+        or aspect > 2.0
+        or (solidity < 0.85 and area_pct > 3.0)
+	or (circularity < 0.35 and area_pct > 0.3)
     )
 
     if is_cystic and not is_malignant:
@@ -172,14 +173,14 @@ def classify_from_mask(mask: np.ndarray) -> dict:
     elif is_malignant:
         irregularity = float(np.clip(1.0 - solidity, 0.0, 1.0))
         size_factor  = float(np.clip(area_pct / 30.0, 0.0, 1.0))
-        malign_conf  = float(np.clip(0.55 + 0.20 * irregularity + 0.15 * size_factor, 0.55, 0.93))
-        benign_conf  = float(np.clip(0.30 - 0.15 * irregularity, 0.03, 0.25))
-        cystic_conf  = float(np.clip(0.10 - 0.05 * irregularity, 0.01, 0.10))
+        malign_conf  = float(np.clip(0.75 + 0.12 * irregularity + 0.08 * size_factor, 0.82, 0.95))
+        benign_conf  = float(np.clip(0.12 - 0.08 * irregularity, 0.02, 0.12))
+        cystic_conf  = float(np.clip(0.05 - 0.02 * irregularity, 0.01, 0.05))
         no_tum_conf  = 0.02
         raw = [no_tum_conf, benign_conf, malign_conf, cystic_conf]
 
     else:
-        benign_conf = float(np.clip(0.55 + 0.20 * solidity - 0.10 * (aspect - 1.0), 0.50, 0.90))
+        benign_conf = float(np.clip(0.75 + 0.30 * solidity - 0.07 * (aspect - 1.0), 0.70, 0.95))
         malign_conf = float(np.clip(0.20 - 0.10 * solidity, 0.03, 0.20))
         cystic_conf = float(np.clip(0.15 * circularity, 0.02, 0.15))
         no_tum_conf = 0.02
