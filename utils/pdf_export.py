@@ -1,262 +1,354 @@
 """
-PancrAI — PDF Export Utility
-Converts HTML diagnostic reports to downloadable PDF files.
-Uses ReportLab as the primary engine with an html2pdf fallback.
+PancrAI — PDF Report Export
+Generates a professional PDF clinical report using reportlab.
+Falls back to HTML if reportlab is not available.
 """
 
-import io
 import os
-import re
+import io
+import base64
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 
-def html_to_pdf_bytes(html_content: str) -> bytes:
+def generate_pdf_report(
+    patient_info: Dict,
+    result: Dict,
+    staging_report: Optional[Dict] = None,
+    radiomics: Optional[Dict] = None,
+    report_html: Optional[str] = None,
+) -> bytes:
     """
-    Convert an HTML report string to a PDF byte stream.
-
-    Tries ReportLab for rich formatting. Falls back to a plain-text
-    PDF if the HTML is too complex or ReportLab is unavailable.
+    Generate a PDF clinical report.
 
     Args:
-        html_content: Full HTML string (e.g., from gemini_report).
+        patient_info: Patient demographics dict
+        result: Analysis result dict from run_inline_analysis
+        staging_report: TNM staging report dict (optional)
+        radiomics: Radiomics features dict (optional)
+        report_html: Gemini-generated HTML report (optional)
 
     Returns:
-        Raw PDF bytes ready for st.download_button or HTTP response.
+        PDF bytes
     """
     try:
-        return _reportlab_pdf(html_content)
-    except Exception as e:
-        print(f"[PDF] ReportLab failed ({e}), using plain-text fallback")
-        return _plaintext_pdf(html_content)
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm, cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+            HRFlowable, PageBreak
+        )
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+        from reportlab.platypus import Image as RLImage
+
+        return _generate_pdf_reportlab(
+            patient_info, result, staging_report, radiomics
+        )
+
+    except ImportError:
+        # Fallback: return HTML as bytes
+        html = _generate_html_fallback(patient_info, result, staging_report)
+        return html.encode("utf-8")
 
 
-def _strip_html(html: str) -> str:
-    """Remove HTML tags and decode common entities."""
-    text = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL)
-    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL)
-    text = re.sub(r"<br\s*/?>", "\n", text)
-    text = re.sub(r"<p[^>]*>", "\n", text)
-    text = re.sub(r"</p>", "\n", text)
-    text = re.sub(r"<li[^>]*>", "\n  • ", text)
-    text = re.sub(r"<h[1-6][^>]*>", "\n### ", text)
-    text = re.sub(r"</h[1-6]>", "\n", text)
-    text = re.sub(r"<[^>]+>", "", text)
-    # Entities
-    entities = {
-        "&amp;": "&", "&lt;": "<", "&gt;": ">",
-        "&nbsp;": " ", "&#39;": "'", "&quot;": '"',
-    }
-    for ent, char in entities.items():
-        text = text.replace(ent, char)
-    # Collapse whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def _reportlab_pdf(html_content: str) -> bytes:
-    """
-    Generate a styled PDF using ReportLab.
-    Parses the HTML sections from the PancrAI report format.
-    """
+def _generate_pdf_reportlab(patient_info, result, staging_report, radiomics):
+    """Generate PDF using reportlab."""
+    from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.colors import HexColor, white, black
     from reportlab.lib.units import mm
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, HRFlowable,
-        Table, TableStyle, KeepTogether,
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        HRFlowable, PageBreak, KeepTogether
     )
-    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
-    buffer = io.BytesIO()
+    buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=20 * mm,
-        rightMargin=20 * mm,
-        topMargin=20 * mm,
-        bottomMargin=20 * mm,
+        buf, pagesize=A4,
+        rightMargin=20*mm, leftMargin=20*mm,
+        topMargin=20*mm, bottomMargin=20*mm
     )
+
+    # Colors
+    BLUE      = colors.HexColor("#1F5C99")
+    LIGHTBLUE = colors.HexColor("#E8F0FE")
+    DARKGRAY  = colors.HexColor("#333333")
+    MIDGRAY   = colors.HexColor("#666666")
+    RED       = colors.HexColor("#D32F2F")
+    ORANGE    = colors.HexColor("#F57C00")
+    GREEN     = colors.HexColor("#388E3C")
 
     styles = getSampleStyleSheet()
 
-    # Custom styles
-    style_title = ParagraphStyle(
-        "Title",
-        parent=styles["Normal"],
-        fontSize=18,
-        fontName="Helvetica-Bold",
-        textColor=HexColor("#1565C0"),
-        alignment=TA_CENTER,
-        spaceAfter=4,
-    )
-    style_subtitle = ParagraphStyle(
-        "Subtitle",
-        parent=styles["Normal"],
-        fontSize=10,
-        textColor=HexColor("#555555"),
-        alignment=TA_CENTER,
-        spaceAfter=12,
-    )
-    style_section = ParagraphStyle(
-        "Section",
-        parent=styles["Normal"],
-        fontSize=12,
-        fontName="Helvetica-Bold",
-        textColor=HexColor("#1565C0"),
-        spaceBefore=14,
-        spaceAfter=6,
-        borderPad=4,
-        borderColor=HexColor("#1565C0"),
-        borderWidth=0,
-        leftIndent=0,
-    )
-    style_body = ParagraphStyle(
-        "Body",
-        parent=styles["Normal"],
-        fontSize=10,
-        leading=15,
-        textColor=HexColor("#333333"),
-        spaceAfter=4,
-        alignment=TA_JUSTIFY,
-    )
-    style_bullet = ParagraphStyle(
-        "Bullet",
-        parent=styles["Normal"],
-        fontSize=10,
-        leading=14,
-        textColor=HexColor("#333333"),
-        leftIndent=16,
-        bulletIndent=8,
-        spaceAfter=2,
-    )
-    style_disclaimer = ParagraphStyle(
-        "Disclaimer",
-        parent=styles["Normal"],
-        fontSize=8,
-        textColor=HexColor("#888888"),
-        alignment=TA_CENTER,
-        spaceBefore=20,
-    )
+    title_style = ParagraphStyle("Title",
+        fontSize=22, textColor=BLUE, fontName="Helvetica-Bold",
+        alignment=TA_CENTER, spaceAfter=6)
+    subtitle_style = ParagraphStyle("Subtitle",
+        fontSize=12, textColor=MIDGRAY, fontName="Helvetica",
+        alignment=TA_CENTER, spaceAfter=4)
+    h1_style = ParagraphStyle("H1",
+        fontSize=14, textColor=BLUE, fontName="Helvetica-Bold",
+        spaceBefore=14, spaceAfter=6, borderPad=4)
+    h2_style = ParagraphStyle("H2",
+        fontSize=11, textColor=DARKGRAY, fontName="Helvetica-Bold",
+        spaceBefore=8, spaceAfter=4)
+    body_style = ParagraphStyle("Body",
+        fontSize=9, textColor=DARKGRAY, fontName="Helvetica",
+        alignment=TA_JUSTIFY, spaceAfter=4, leading=14)
+    small_style = ParagraphStyle("Small",
+        fontSize=8, textColor=MIDGRAY, fontName="Helvetica",
+        spaceAfter=2)
+    warn_style = ParagraphStyle("Warn",
+        fontSize=9, textColor=RED, fontName="Helvetica-Bold",
+        spaceAfter=4)
+
+    def tbl_style(header_color=BLUE):
+        return TableStyle([
+            ("BACKGROUND",    (0,0), (-1,0), header_color),
+            ("TEXTCOLOR",     (0,0), (-1,0), colors.white),
+            ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0,0), (-1,0), 9),
+            ("FONTNAME",      (0,1), (-1,-1), "Helvetica"),
+            ("FONTSIZE",      (0,1), (-1,-1), 8),
+            ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, LIGHTBLUE]),
+            ("GRID",          (0,0), (-1,-1), 0.5, colors.HexColor("#CCCCCC")),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING",    (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ("LEFTPADDING",   (0,0), (-1,-1), 6),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 6),
+        ])
 
     story = []
+    W = A4[0] - 40*mm  # usable width
 
-    # ── Header ──
-    story.append(Paragraph("PancrAI — AI-Assisted Radiology Report", style_title))
+    # ── Header ────────────────────────────────────────────────────────────────
+    story.append(Paragraph("PancrAI", title_style))
+    story.append(Paragraph("Intelligent Pancreatic Tumor Detection", subtitle_style))
+    story.append(Paragraph("AI-Assisted Clinical Diagnostic Report", subtitle_style))
+    story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=10))
+
+    # ── Patient Info ──────────────────────────────────────────────────────────
+    story.append(Paragraph("PATIENT INFORMATION", h1_style))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    pat_data = [
+        ["Field", "Value", "Field", "Value"],
+        ["Patient Name",  patient_info.get("name", "N/A"),
+         "Report Date",   now],
+        ["Age",           str(patient_info.get("age", "N/A")),
+         "Sex",           patient_info.get("sex", "N/A")],
+        ["Scan Type",     patient_info.get("scan_type", "CT"),
+         "Risk Level",    result.get("risk_level", "N/A")],
+        ["Symptoms",      patient_info.get("symptoms", "None provided")[:40],
+         "Report ID",     f"PCR-{datetime.now().strftime('%Y%m%d%H%M')}"],
+    ]
+    t = Table(pat_data, colWidths=[W*0.18, W*0.32, W*0.18, W*0.32])
+    t.setStyle(tbl_style())
+    story.append(t)
+    story.append(Spacer(1, 8))
+
+    # ── Analysis Results ──────────────────────────────────────────────────────
+    story.append(Paragraph("ANALYSIS RESULTS", h1_style))
+
+    tumor_class = result.get("tumor_class", "Unknown")
+    confidence  = result.get("primary_confidence", 0.0)
+    uncertainty = result.get("uncertainty_score", 0.0)
+    dice        = result.get("dice_score", 0.0)
+    iou         = result.get("iou_score", 0.0)
+
+    res_color = RED if "Malignant" in tumor_class else ORANGE if tumor_class == "Cystic (IPMN)" else GREEN
+    res_data = [
+        ["Metric", "Value", "Metric", "Value"],
+        ["Detection Result",  tumor_class,
+         "Primary Confidence",f"{confidence*100:.1f}%"],
+        ["Risk Level",        result.get("risk_level", "N/A"),
+         "Uncertainty Score", f"{uncertainty:.1f}%"],
+        ["Dice Score",        f"{dice:.4f}" if dice > 0 else "N/A",
+         "IoU Score",         f"{iou:.4f}" if iou > 0 else "N/A"],
+        ["Tumor Detected",    "Yes" if result.get("tumor_detected") else "No",
+         "TTA Augmentations", "8x (enabled)"],
+    ]
+    t = Table(res_data, colWidths=[W*0.22, W*0.28, W*0.22, W*0.28])
+    t.setStyle(tbl_style())
+    story.append(t)
+    story.append(Spacer(1, 6))
+
+    # Uncertainty warning
+    if uncertainty > 60:
+        story.append(Paragraph(
+            f"⚠ HIGH UNCERTAINTY ({uncertainty:.1f}%) — Specialist radiologist review strongly recommended",
+            warn_style))
+
+    # ── Tumor Measurements ────────────────────────────────────────────────────
+    measurements = result.get("measurements")
+    if measurements:
+        story.append(Paragraph("TUMOR MEASUREMENTS", h1_style))
+        meas_data = [
+            ["Measurement", "Value", "Measurement", "Value"],
+            ["Area (cm²)",      f"{measurements.get('area_cm2', 0):.3f}",
+             "Area (pixels)",   str(measurements.get("area_pixels", "N/A"))],
+            ["Centroid X",      f"{measurements.get('centroid_x', 0):.0f} px",
+             "Centroid Y",      f"{measurements.get('centroid_y', 0):.0f} px"],
+            ["Bounding Box W",  f"{measurements.get('bbox_w', 0)} px",
+             "Bounding Box H",  f"{measurements.get('bbox_h', 0)} px"],
+            ["Aspect Ratio",    f"{measurements.get('aspect_ratio', 0):.3f}",
+             "Area %",          f"{measurements.get('area_pct', 0):.2f}%"],
+        ]
+        t = Table(meas_data, colWidths=[W*0.22, W*0.28, W*0.22, W*0.28])
+        t.setStyle(tbl_style())
+        story.append(t)
+        story.append(Spacer(1, 6))
+
+    # ── TNM Staging ───────────────────────────────────────────────────────────
+    if staging_report:
+        story.append(Paragraph("TNM STAGING ASSESSMENT", h1_style))
+
+        ts   = staging_report.get("t_stage", {})
+        os_  = staging_report.get("overall_stage", {})
+        res  = staging_report.get("resectability", {})
+        risk = staging_report.get("risk_score", {})
+
+        stg_data = [
+            ["Parameter", "Value"],
+            ["T-Stage",              ts.get("t_stage", "N/A")],
+            ["Size Estimate",        ts.get("size_estimate", "N/A")],
+            ["Overall Stage",        os_.get("overall_stage", "N/A")],
+            ["TNM Classification",   os_.get("tnm", "N/A")],
+            ["5-Year Survival Est.", os_.get("five_year_survival", "N/A")],
+            ["Resectability",        res.get("status", "N/A")],
+            ["Suggested Procedure",  res.get("procedure", "MDT review required")],
+            ["Composite Risk Score", f"{risk.get('score', 0)}/100 — {risk.get('category', 'N/A')}"],
+        ]
+        t = Table(stg_data, colWidths=[W*0.40, W*0.60])
+        t.setStyle(tbl_style())
+        story.append(t)
+        story.append(Spacer(1, 6))
+
+        # Recommendations
+        recs = risk.get("recommendations", [])
+        if recs:
+            story.append(Paragraph("Clinical Recommendations:", h2_style))
+            for rec in recs:
+                story.append(Paragraph(f"• {rec}", body_style))
+        story.append(Spacer(1, 6))
+
+    # ── Radiomics Summary ─────────────────────────────────────────────────────
+    if radiomics:
+        story.append(Paragraph("RADIOMICS FEATURE SUMMARY", h1_style))
+
+        key_features = [
+            ["Feature", "Value", "Feature", "Value"],
+            ["Shape Circularity", f"{radiomics.get('shape_circularity', 0):.4f}",
+             "Shape Solidity",    f"{radiomics.get('shape_solidity', 0):.4f}"],
+            ["Intensity Mean",    f"{radiomics.get('intensity_mean', 0):.2f}",
+             "Intensity Entropy", f"{radiomics.get('intensity_entropy', 0):.4f}"],
+            ["GLCM Contrast",     f"{radiomics.get('glcm_contrast', 0):.4f}",
+             "GLCM Homogeneity",  f"{radiomics.get('glcm_homogeneity', 0):.4f}"],
+            ["LBP Entropy",       f"{radiomics.get('lbp_entropy', 0):.4f}",
+             "Gradient Edge Den.",f"{radiomics.get('gradient_edge_density', 0):.4f}"],
+            ["Wavelet LL Mean",   f"{radiomics.get('wavelet_ll_mean', 0):.3f}",
+             "GLCM Correlation",  f"{radiomics.get('glcm_correlation', 0):.4f}"],
+        ]
+        t = Table(key_features, colWidths=[W*0.22, W*0.28, W*0.22, W*0.28])
+        t.setStyle(tbl_style())
+        story.append(t)
+        story.append(Spacer(1, 6))
+
+    # ── Confidence Scores ─────────────────────────────────────────────────────
+    story.append(Paragraph("CLASSIFIER CONFIDENCE SCORES", h1_style))
+    scores = result.get("confidence_scores", [0.25, 0.25, 0.25, 0.25])
+    classes = ["No Tumor", "Benign", "Malignant (PDAC)", "Cystic (IPMN)"]
+    conf_data = [["Class", "Confidence", "Visual"]]
+    for cls, sc in zip(classes, scores):
+        bar = "█" * int(sc * 20) + "░" * (20 - int(sc * 20))
+        conf_data.append([cls, f"{sc*100:.1f}%", bar])
+    t = Table(conf_data, colWidths=[W*0.30, W*0.15, W*0.55])
+    t.setStyle(tbl_style())
+    story.append(t)
+    story.append(Spacer(1, 10))
+
+    # ── Disclaimer ────────────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=1, color=BLUE, spaceAfter=6))
     story.append(Paragraph(
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')} | For Research Use Only",
-        style_subtitle,
-    ))
-    story.append(HRFlowable(width="100%", thickness=2,
-                              color=HexColor("#1565C0"), spaceAfter=12))
-
-    # ── Parse sections from stripped HTML ──
-    plain_text = _strip_html(html_content)
-
-    # Split on section headers (### Section Title)
-    section_pattern = re.compile(r"###\s*(.+?)\n(.*?)(?=###|\Z)", re.DOTALL)
-    matches = list(section_pattern.finditer(plain_text))
-
-    if matches:
-        for match in matches:
-            heading = match.group(1).strip()
-            content = match.group(2).strip()
-
-            story.append(Paragraph(heading, style_section))
-            story.append(HRFlowable(width="100%", thickness=0.5,
-                                     color=HexColor("#CCCCCC"), spaceAfter=6))
-
-            # Split into bullets and paragraphs
-            for line in content.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("•") or line.startswith("-"):
-                    story.append(Paragraph(f"• {line.lstrip('•- ').strip()}", style_bullet))
-                else:
-                    story.append(Paragraph(line, style_body))
-
-            story.append(Spacer(1, 6))
-    else:
-        # No sections found — just render plain text
-        for line in plain_text.split("\n"):
-            if line.strip():
-                story.append(Paragraph(line.strip(), style_body))
-
-    # ── Disclaimer ──
-    story.append(Spacer(1, 20))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#CCCCCC")))
-    story.append(Paragraph(
-        "⚠ DISCLAIMER: This report was generated by an AI system and is intended for "
-        "informational and research purposes only. It must be reviewed and validated by a "
+        "⚠ DISCLAIMER: This report was generated by an AI-assisted system (PancrAI) "
+        "for decision support purposes only. It must be reviewed and validated by a "
         "licensed radiologist or physician before any clinical decision-making. "
-        "PancrAI is NOT FDA/CE approved and does NOT replace professional medical judgment.",
-        style_disclaimer,
-    ))
+        "PancrAI does not replace professional medical judgment. All staging, "
+        "resectability, and risk assessments are estimates requiring clinical correlation.",
+        small_style))
+    story.append(Paragraph(
+        f"Generated: {now} | PancrAI v1.0 | For Research Use Only",
+        small_style))
 
     doc.build(story)
-    return buffer.getvalue()
+    return buf.getvalue()
 
 
-def _plaintext_pdf(html_content: str) -> bytes:
-    """
-    Ultra-simple PDF fallback using only ReportLab basic canvas.
-    Works even if Platypus has issues.
-    """
-    try:
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.pagesizes import A4
+def _generate_html_fallback(patient_info, result, staging_report):
+    """HTML fallback when reportlab is not available."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    tumor_class = result.get("tumor_class", "Unknown")
+    confidence  = result.get("primary_confidence", 0.0)
+    risk        = result.get("risk_level", "Unknown")
+    unc         = result.get("uncertainty_score", 0.0)
 
-        buffer = io.BytesIO()
-        c = canvas.Canvas(buffer, pagesize=A4)
-        W, H = A4
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PancrAI Report — {patient_info.get('name','Patient')}</title>
+<style>
+  body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px; color: #333; }}
+  h1 {{ color: #1F5C99; border-bottom: 2px solid #1F5C99; padding-bottom: 8px; }}
+  h2 {{ color: #2E75B6; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; }}
+  th {{ background: #1F5C99; color: white; padding: 8px; text-align: left; }}
+  td {{ padding: 6px 8px; border: 1px solid #ddd; }}
+  tr:nth-child(even) {{ background: #f5f8fc; }}
+  .disclaimer {{ background: #FFF9C4; border: 1px solid #F9A825; padding: 12px; border-radius: 4px; font-size: 12px; }}
+</style>
+</head>
+<body>
+<h1>PancrAI — AI-Assisted Clinical Report</h1>
+<p><strong>Patient:</strong> {patient_info.get('name','N/A')} |
+   <strong>Age:</strong> {patient_info.get('age','N/A')} |
+   <strong>Date:</strong> {now}</p>
+<h2>Analysis Results</h2>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Detection Result</td><td><strong>{tumor_class}</strong></td></tr>
+  <tr><td>Confidence</td><td>{confidence*100:.1f}%</td></tr>
+  <tr><td>Risk Level</td><td>{risk}</td></tr>
+  <tr><td>Uncertainty</td><td>{unc:.1f}%</td></tr>
+</table>
+<div class="disclaimer">
+⚠ This report was generated by an AI system for decision support only.
+Must be reviewed by a licensed radiologist before clinical use.
+</div>
+</body>
+</html>"""
+    return html
 
-        plain = _strip_html(html_content)
-        lines = plain.split("\n")
 
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, H - 50, "PancrAI — Radiology Report")
-        c.setFont("Helvetica", 8)
-        c.drawString(40, H - 65, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-
-        c.setFont("Helvetica", 10)
-        y = H - 90
-        for line in lines:
-            if not line.strip():
-                y -= 6
-                continue
-            if y < 60:
-                c.showPage()
-                y = H - 50
-                c.setFont("Helvetica", 10)
-            c.drawString(40, y, line[:100])  # truncate long lines
-            y -= 14
-
-        c.setFont("Helvetica", 7)
-        c.drawString(40, 40, "DISCLAIMER: AI-generated report — for research use only. Not for clinical decision-making.")
-
-        c.save()
-        return buffer.getvalue()
-
-    except Exception as e:
-        # Last resort: return a minimal valid PDF string
-        raise RuntimeError(f"PDF generation completely failed: {e}")
-
-
-def save_report_pdf(html_content: str, output_path: str) -> str:
-    """
-    Generate and save a PDF report to disk.
-
-    Args:
-        html_content: HTML report string.
-        output_path: File path to write the PDF.
-
-    Returns:
-        Absolute path to the saved PDF.
-    """
-    pdf_bytes = html_to_pdf_bytes(html_content)
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "wb") as f:
+if __name__ == "__main__":
+    print("Testing PDF generation...")
+    test_patient = {"name": "Test Patient", "age": 65, "sex": "Male",
+                    "scan_type": "CT", "symptoms": "Epigastric pain"}
+    test_result = {
+        "tumor_class": "Malignant (PDAC)", "primary_confidence": 0.87,
+        "risk_level": "High", "uncertainty_score": 22.0,
+        "tumor_detected": True, "dice_score": 0.8204, "iou_score": 0.7671,
+        "confidence_scores": [0.02, 0.08, 0.87, 0.03],
+        "measurements": {"area_cm2": 3.5, "area_pixels": 700,
+                         "centroid_x": 112, "centroid_y": 98,
+                         "bbox_w": 35, "bbox_h": 30, "aspect_ratio": 1.17,
+                         "area_pct": 1.39},
+    }
+    pdf_bytes = generate_pdf_report(test_patient, test_result)
+    with open("/tmp/test_report.pdf", "wb") as f:
         f.write(pdf_bytes)
-    return os.path.abspath(output_path)
+    print(f"PDF generated: {len(pdf_bytes)} bytes")
+    print("Check /tmp/test_report.pdf")
