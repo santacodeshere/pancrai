@@ -151,22 +151,32 @@ def run_inline_analysis(file_bytes, filename, patient_info,
         )
         import torch
 
+        # ── FIX 1: Aggressive GPU memory cleanup before loading ───────────────
+        import gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+
         image            = load_from_bytes(file_bytes, filename)
         preprocess_steps = run_full_pipeline(image)
 
         if "seg_model" not in st.session_state:
             seg_weights = os.getenv("MODEL_WEIGHTS_PATH", "./weights/transunet_best.pth")
             with st.spinner("Loading AI models..."):
-                st.session_state.seg_model  = build_transunet(weights_path=seg_weights)
-                st.session_state.cls_model  = build_classifier()
+                st.session_state.seg_model = build_transunet(weights_path=seg_weights)
+                st.session_state.seg_model.eval()
+                st.session_state.cls_model = build_classifier()
                 st.session_state.light_unet = build_light_unet()
+                # Move all models to CPU initially — only move to GPU when needed
+                st.session_state.light_unet.eval()
 
         seg_model  = st.session_state.seg_model
         light_unet = st.session_state.light_unet
         tensor     = preprocess_to_tensor(image)
         image_np   = np.array(image) if not isinstance(image, np.ndarray) else image
 
-        # ── Segmentation ──────────────────────────────────────────────────────
+        # ── FIX 2: Segmentation with memory cleanup after ─────────────────────
         if use_ensemble:
             seg_result = run_ensemble_segmentation(
                 seg_model, light_unet, tensor, image_np, primary_weight=0.70)
@@ -175,6 +185,11 @@ def run_inline_analysis(file_bytes, filename, patient_info,
                 seg_model, tensor, image_np, n_aug=8, threshold=0.5)
         else:
             seg_result = run_segmentation(image, seg_model)
+
+        # Free GPU memory immediately after segmentation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         # ── Classification ────────────────────────────────────────────────────
         seg_mask   = seg_result.get("mask")
@@ -187,9 +202,7 @@ def run_inline_analysis(file_bytes, filename, patient_info,
         probs       = cls_result["confidence_scores"]
         risk        = cls_result["risk_level"]
 
-        # ── Grad-CAM ─────────────────────────────────────────────────────────
-        # FIX: pass image_np (not raw image) and DO NOT pass measurements as
-        #      positional arg — use keyword so signature matches gradcam.py
+        # ── Grad-CAM ──────────────────────────────────────────────────────────
         gradcam_b64   = None
         gradcampp_b64 = None
         try:
@@ -266,17 +279,25 @@ def run_inline_analysis(file_bytes, filename, patient_info,
         # Free GPU memory before uncertainty
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        gc.collect()
 
-        # ── Uncertainty ───────────────────────────────────────────────────────
+        # ── FIX 3: Uncertainty — reduced T passes to avoid OOM ────────────────
         unc_score   = 0.0
         unc_details = {}
         try:
             from app.services.uncertainty import mc_dropout_inference
-            unc         = mc_dropout_inference(seg_model, tensor.clone(), T=10)
+            # Use T=5 instead of T=20 to prevent OOM on 6GB GPU
+            # when ensemble or TTA is also active
+            T_passes = 5 if (use_ensemble or use_tta) else 10
+            unc = mc_dropout_inference(seg_model, tensor.clone(), T=T_passes)
             unc_score   = unc["uncertainty_score"]
             unc_details = unc
         except Exception as e:
             st.warning(f"Uncertainty: {e}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
         return {
             "tumor_detected":      pred_idx > 0,
@@ -302,7 +323,6 @@ def run_inline_analysis(file_bytes, filename, patient_info,
             "images": {
                 "preprocessing_steps":  preprocess_steps,
                 "segmentation_overlay": seg_result.get("overlay_b64"),
-                # FIX: store both gradcam and gradcam++ under consistent keys
                 "gradcam":              gradcam_b64,
                 "gradcampp":            gradcampp_b64,
             },
@@ -744,7 +764,6 @@ def _render_results_panel(result, patient_info,
                 st.image(pil, use_container_width=True)
         st.caption("Red = tumor region | Yellow = bounding box | Green = centroid")
 
-        # FIX: read from the correct key "gradcam" (set by run_inline_analysis)
         gc_b64   = result.get("images", {}).get("gradcam")
         gcpp_b64 = result.get("images", {}).get("gradcampp")
 
@@ -1435,10 +1454,11 @@ def page_records():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
+# Sidebar — FIX 4 + FIX 5: GPU monitor + cache clear button
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sidebar():
+    import torch  # FIX 5 — import torch at top of sidebar (used for GPU monitor)
     with st.sidebar:
         st.markdown('<div class="pancrai-logo">Pancr<span>AI</span></div>',
                     unsafe_allow_html=True)
@@ -1476,6 +1496,36 @@ def sidebar():
             ✅ Gemini AI reports<br>
             ✅ Groq clinical chat<br>
         </div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── FIX 4: GPU memory monitor + one-click cache clear ─────────────────
+        if st.button("🧹 Clear GPU Cache",
+                     help="Use if the app slows down or crashes with OOM errors"):
+            import gc
+            for key in ["seg_model", "cls_model", "light_unet"]:
+                if key in st.session_state:
+                    model = st.session_state.pop(key)
+                    del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+            st.success("GPU cache cleared! Models will reload on next analysis.")
+            st.rerun()
+
+        if torch.cuda.is_available():
+            used  = torch.cuda.memory_allocated() / 1e9
+            total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            pct   = used / total * 100
+            color = ("#F44336" if pct > 80
+                     else "#FF9800" if pct > 60
+                     else "#4CAF50")
+            st.markdown(
+                f'<div style="font-size:0.72rem;color:{color};margin-top:4px">'
+                f'GPU: {used:.1f}/{total:.1f} GB ({pct:.0f}%)</div>',
+                unsafe_allow_html=True)
+
         st.markdown("---")
         st.markdown(
             '<div style="font-size:0.7rem;color:#4A4F58;text-align:center">'
